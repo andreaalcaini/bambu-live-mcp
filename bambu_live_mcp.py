@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import ctypes
 import datetime as _dt
 import functools
@@ -35,6 +36,9 @@ from typing import Any
 
 import anyio
 from mcp.server.fastmcp import FastMCP
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bambu_project as bp  # noqa: E402
 
 # --------------------------------------------------------------------------------------
 # Configurazione
@@ -68,6 +72,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Analisi geometrica degli sbalzi (gradi dal piano orizzontale, sotto cui serve supporto)
     "overhang_critical_angle_deg": 30,
     "overhang_warning_angle_deg": 45,
+    # I ponti (soffitti appoggiati su due lati opposti) fino a questa luce sono considerati ok
+    "bridge_ok_span_mm": 15,
+    # Distanza tra gli oggetti quando il tool li ridispone
+    "arrange_spacing_mm": 6,
 }
 
 CREATE_NO_WINDOW = 0x08000000
@@ -566,34 +574,6 @@ def _compose(a: list[float], b: list[float]) -> list[float]:
     return C[0][:3] + C[1][:3] + C[2][:3] + C[3][:3]
 
 
-def rotate_build_items(model_xml: str, deg: float) -> tuple[str, int]:
-    """Ruota ogni item del <build> attorno all'asse Z passante per la sua origine
-    (Bambu Studio centra l'origine dell'oggetto sul suo bounding box)."""
-    th = math.radians(deg)
-    c, s = math.cos(th), math.sin(th)
-    count = 0
-
-    def rot_item(m: re.Match) -> str:
-        nonlocal count
-        tag = m.group(0)
-        tm = re.search(r'transform="([^"]*)"', tag)
-        M = _parse_transform(tm.group(1) if tm else None)
-        for r in range(3):
-            x, y = M[r * 3], M[r * 3 + 1]
-            M[r * 3], M[r * 3 + 1] = x * c - y * s, x * s + y * c
-        count += 1
-        new_t = f'transform="{_fmt_transform(M)}"'
-        if tm:
-            return tag[:tm.start()] + new_t + tag[tm.end():]
-        return tag.replace("<item", f"<item {new_t}", 1)
-
-    build = re.search(r"<build\b.*?</build>", model_xml, re.S)
-    if not build:
-        return model_xml, 0
-    new_build = re.sub(r"<item\b[^>]*>", rot_item, build.group(0))
-    return model_xml[:build.start()] + new_build + model_xml[build.end():], count
-
-
 def center_build_items(model_xml: str, cx: float, cy: float) -> str:
     build = re.search(r"<build\b.*?</build>", model_xml, re.S)
     if not build:
@@ -625,118 +605,6 @@ def _bed_center(ps: dict) -> tuple[float, float] | None:
         return (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
     except Exception:
         return None
-
-
-def load_world_triangles(threemf: Path, max_tris: int = 3_000_000) -> list[tuple]:
-    """Restituisce i triangoli in coordinate del piatto (lista di 3 tuple xyz)."""
-    with zipfile.ZipFile(threemf) as z:
-        names = set(z.namelist())
-        cache: dict[str, dict] = {}
-
-        def objects_of(entry: str) -> dict:
-            if entry not in cache:
-                xml = z.read(entry).decode("utf-8", "replace")
-                objs = {}
-                for om in re.finditer(r"<object\b([^>]*)>(.*?)</object>", xml, re.S):
-                    a = _attrs(om.group(1))
-                    objs[a.get("id")] = om.group(2)
-                cache[entry] = objs
-            return cache[entry]
-
-        tris: list[tuple] = []
-
-        def emit(entry: str, oid: str, M: list[float], depth: int = 0) -> None:
-            if depth > 10 or len(tris) > max_tris:
-                return
-            body = objects_of(entry).get(oid)
-            if body is None:
-                return
-            if "<mesh" in body:
-                vs = [(float(a.get("x", 0)), float(a.get("y", 0)), float(a.get("z", 0)))
-                      for a in (_attrs(x) for x in re.findall(r"<vertex\b([^>]*)/?>", body))]
-                W = [(x * M[0] + y * M[3] + zz * M[6] + M[9],
-                      x * M[1] + y * M[4] + zz * M[7] + M[10],
-                      x * M[2] + y * M[5] + zz * M[8] + M[11]) for x, y, zz in vs]
-                for t in re.findall(r"<triangle\b([^>]*)/?>", body):
-                    a = _attrs(t)
-                    try:
-                        tris.append((W[int(a["v1"])], W[int(a["v2"])], W[int(a["v3"])]))
-                    except (KeyError, IndexError, ValueError):
-                        pass
-            for cm in re.finditer(r"<component\b([^>]*)/?>", body):
-                a = _attrs(cm.group(1))
-                path = a.get("p:path", "")
-                sub = path.lstrip("/") if path else entry
-                if sub not in names:
-                    continue
-                emit(sub, a.get("objectid"), _compose(_parse_transform(a.get("transform")), M), depth + 1)
-
-        root = z.read(MODEL_ENTRY).decode("utf-8", "replace")
-        build = re.search(r"<build\b.*?</build>", root, re.S)
-        for it in re.findall(r"<item\b([^>]*)>", build.group(0) if build else ""):
-            a = _attrs(it)
-            if a.get("printable", "1") == "0":
-                continue
-            path = a.get("p:path", "")
-            emit(path.lstrip("/") if path else MODEL_ENTRY, a.get("objectid"), _parse_transform(a.get("transform")))
-    return tris
-
-
-def analyze_overhangs(threemf: Path, critical_deg: float, warning_deg: float) -> dict:
-    """Stima geometrica degli sbalzi: facce rivolte verso il basso con angolo dal piano
-    orizzontale inferiore alla soglia, escluse quelle appoggiate al piatto."""
-    try:
-        tris = load_world_triangles(threemf)
-    except Exception as e:
-        return {"error": f"analisi geometrica non riuscita: {e}"}
-    if not tris:
-        return {"error": "nessuna mesh trovata"}
-    zmin = min(min(p[2] for p in t) for t in tris)
-    zmax = max(max(p[2] for p in t) for t in tris)
-    cos_crit = math.cos(math.radians(critical_deg))
-    cos_warn = math.cos(math.radians(warning_deg))
-    crit_area = warn_area = 0.0
-    crit_z: dict[float, float] = {}
-    bbox = [math.inf, math.inf, -math.inf, -math.inf]
-    for a, b, c in tris:
-        if max(a[2], b[2], c[2]) <= zmin + 0.3:
-            continue  # appoggiato al piatto
-        ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
-        vx, vy, vz = c[0] - a[0], c[1] - a[1], c[2] - a[2]
-        nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
-        ln = math.sqrt(nx * nx + ny * ny + nz * nz)
-        if ln == 0 or nz >= 0:
-            continue
-        area = ln / 2
-        down = -nz / ln  # 1 = soffitto piatto
-        if down >= cos_crit:
-            crit_area += area
-            zl = round(min(a[2], b[2], c[2]) - zmin, 1)
-            crit_z[zl] = crit_z.get(zl, 0) + area
-            for p in (a, b, c):
-                bbox = [min(bbox[0], p[0]), min(bbox[1], p[1]), max(bbox[2], p[0]), max(bbox[3], p[1])]
-        elif down >= cos_warn:
-            warn_area += area
-    top_levels = sorted(crit_z.items(), key=lambda kv: -kv[1])[:8]
-    res = {
-        "triangles": len(tris),
-        "height_mm": round(zmax - zmin, 2),
-        "critical_overhang_area_mm2": round(crit_area, 1),
-        "moderate_overhang_area_mm2": round(warn_area, 1),
-        "critical_angle_deg": critical_deg,
-        "warning_angle_deg": warning_deg,
-        "critical_levels_z_mm": [{"z": z, "area_mm2": round(ar, 1)} for z, ar in sorted(top_levels)],
-    }
-    if crit_area > 0:
-        res["critical_region_xy_bbox"] = [round(x, 1) for x in bbox]
-    if crit_area > 25:
-        res["verdict"] = ("ATTENZIONE: superfici a sbalzo critiche senza supporto (possono essere anche "
-                          "ponti tra due appoggi, che di solito stampano bene). Valuta supporti, rotazione o modifica CAD.")
-    elif crit_area > 0 or warn_area > 0:
-        res["verdict"] = "Sbalzi lievi: probabilmente stampabile senza supporti."
-    else:
-        res["verdict"] = "Nessuno sbalzo critico rilevato."
-    return res
 
 
 # --------------------------------------------------------------------------------------
@@ -1332,96 +1200,218 @@ def _replace_with_retry(src: Path, dst: Path, tries: int = 10) -> None:
             time.sleep(0.5)
 
 
-def process_3mf(threemf_path: str, settings_patch: dict | str | None, rotate_z_deg: float = 0.0,
-                run_slice: bool = True, reload_gui: bool = True, machine: str = "", process: str = "",
-                filament: str = "", confirm_close_unsaved: bool = False) -> dict:
+def _resolve(path: str) -> Path:
+    p = Path(os.path.expandvars(str(path).strip().strip('"'))).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"File non trovato: {p}")
+    return p
+
+
+def _prepare_project(src: Path, work: Path, machine: str = "", process: str = "",
+                     filament: str = "") -> tuple[Path, Path, dict | None]:
+    """Copia di lavoro del progetto; i file grezzi dal CAD vengono prima inizializzati coi profili."""
+    is_raw_ext = src.suffix.lower() in RAW_EXTS
+    project_dst = src.with_suffix(".3mf") if is_raw_ext else src
+    ps = None if is_raw_ext else read_project_settings(src)
+    proj = work / "project.3mf"
+    if ps is not None:
+        shutil.copy2(src, proj)
+        return proj, project_dst, None
+    names = _profile_names(machine, process, filament)
+    tdir = ensure_template(names)
+    init = cli_init_project(src, tdir, work)
+    shutil.copy2(init, proj)
+    ps = read_project_settings(proj) or {}
+    flat_f = json.loads((tdir / "filament.json").read_text(encoding="utf-8"))
+    if flat_f.get("default_filament_colour"):
+        ps["filament_colour"] = flat_f["default_filament_colour"]
+    with zipfile.ZipFile(proj) as z:
+        model = z.read(MODEL_ENTRY).decode("utf-8")
+    c = _bed_center(ps)
+    if c:
+        model = center_build_items(model, *c)
+    rewrite_zip(proj, {PS_ENTRY: json.dumps(ps, indent=4, ensure_ascii=False).encode(), MODEL_ENTRY: model.encode()})
+    return proj, project_dst, {"profiles": names, "template_dir": str(tdir), "bed_center": c}
+
+
+def open_as_project(path: Path, work: Path, tag: str = "src") -> Path:
+    """Restituisce un progetto Bambu (inizializzando i file grezzi) in una sottocartella di lavoro."""
+    sub = work / tag
+    sub.mkdir(parents=True, exist_ok=True)
+    proj, _, _ = _prepare_project(path, sub)
+    return proj
+
+
+def cli_normalize(project: Path, work: Path) -> dict:
+    """Fa riscrivere il progetto a Bambu Studio (CLI): rigenera miniature di ogni piatto,
+    filament_sequence e relazioni interne, e verifica che il file sia caricabile."""
+    out = work / "normalize"
+    r = run_cli(["--outputdir", str(out), "--export-3mf", "project.3mf", str(project)], out, timeout=600)
+    res = out / "project.3mf"
+    if r["returncode"] != 0 or not res.exists():
+        return {"ok": False, "message": (r.get("result") or {}).get("error_string") or r.get("stderr_tail", "")[-300:]}
+    try:
+        before = len(bp.Project(project).objects())
+        after = len(bp.Project(res).objects())
+    except Exception as e:
+        return {"ok": False, "message": f"output CLI non leggibile: {e}"}
+    if before != after:
+        return {"ok": False, "message": f"la CLI ha cambiato il numero di oggetti ({before} -> {after}): scartato"}
+    shutil.copy2(res, project)
+    return {"ok": True}
+
+
+_CAUSES = [
+    (r"conflict", "Oggetti sovrapposti o troppo vicini sullo stesso piatto (G-code conflicts). Usa arrange o "
+                  "controlla layout_check."),
+    (r"outside|out of (the )?(plate|bed)|exceed", "Uno o piu' oggetti escono dal piatto o superano l'altezza massima."),
+    (r"empty|no object|nothing to", "Piatto vuoto o oggetti non stampabili."),
+    (r"floating|suspended", "Parti fluttuanti senza supporto."),
+    (r"compatib|preset|config", "Profili incompatibili o impostazioni non valide."),
+    (r"not found|cannot open|invalid", "File non trovato o non valido."),
+]
+
+
+def probable_cause(slice_rep: dict, layout: dict | None) -> list[str]:
+    text = " ".join(str(slice_rep.get(k) or "") for k in ("cli_message", "stderr_tail", "stdout_tail"))
+    text += " " + " ".join(slice_rep.get("slicer_warnings") or [])
+    out = [msg for pat, msg in _CAUSES if re.search(pat, text, re.I)]
+    for p in (layout or {}).get("problems", []):
+        out.append(p["message"])
+    if slice_rep.get("cli_returncode") == -999:
+        out.append("Timeout dello slicing (slice_timeout_s in config.json).")
+    return out or ["Causa non riconosciuta: vedi cli_message e stderr_tail."]
+
+
+def analyze_project_overhangs(project: Path, cfg: dict) -> dict:
+    """Sbalzi per piatto e per oggetto: regioni {z, area_mm2, tipo, xy_bbox, span_mm}."""
+    try:
+        P = bp.Project(project)
+    except Exception as e:
+        return {"error": str(e)}
+    crit, warn = float(cfg["overhang_critical_angle_deg"]), float(cfg["overhang_warning_angle_deg"])
+    max_span = float(cfg["bridge_ok_span_mm"])
+    plates, overall = [], []
+    for pl in P.plates():
+        objs_rep = []
+        for o in P.objects():
+            if o["plate"] != pl["index"]:
+                continue
+            try:
+                regs = bp.overhang_regions(P.world_mesh(o), crit, warn, origin=P.plate_origin(o["plate"]))
+            except Exception as e:
+                objs_rep.append({"name": o["name"], "error": str(e)})
+                continue
+            issues, level = [], 0  # 0 ok, 1 da_verificare, 2 attenzione
+            for r in regs:
+                xy = r["xy_bbox"]
+                where = f"a z={r['z']} mm, XY {xy[0]}..{xy[2]} x {xy[1]}..{xy[3]}"
+                if r["tipo"] == "ponte" and r["span_mm"] is not None and r["span_mm"] > max_span:
+                    lv = 1 if r["span_mm"] <= 2 * max_span else 2
+                    issues.append(f"ponte lungo {r['span_mm']} mm {where} (soglia {max_span:g} mm"
+                                  f"{': di solito stampabile, verifica' if lv == 1 else ''})")
+                    level = max(level, lv)
+                elif r["tipo"] == "sbalzo" and r["area_mm2"] > 4:
+                    issues.append(f"sbalzo senza appoggio su lati opposti di {r['area_mm2']} mm2 {where}")
+                    level = 2
+                elif r["tipo"] == "inclinata" and r.get("critica") and r["area_mm2"] > 25:
+                    issues.append(f"superficie inclinata sotto {crit:g} gradi di {r['area_mm2']} mm2 {where}")
+                    level = max(level, 1)
+            counts: dict[str, int] = {}
+            for r in regs:
+                counts[r["tipo"]] = counts.get(r["tipo"], 0) + 1
+            verdict = ("ok", "da_verificare", "attenzione")[level]
+            overall.append(verdict)
+            objs_rep.append({"name": o["name"], "verdict": verdict, "issues": issues[:10], "counts": counts,
+                             "regions": regs[:20], "regions_total": len(regs)})
+        plates.append({"plate": pl["index"], "name": pl["name"], "objects": objs_rep})
+    return {"verdict": next((v for v in ("attenzione", "da_verificare") if v in overall), "ok"),
+            "bridge_ok_span_mm": max_span, "critical_angle_deg": crit, "plates": plates,
+            "legend": {"ponte": "soffitto orizzontale appoggiato su due lati opposti (span_mm = luce libera)",
+                       "sbalzo": "soffitto orizzontale senza appoggio su lati opposti",
+                       "inclinata": f"faccia inclinata verso il basso (critica se sotto {crit:g} gradi)"}}
+
+
+def run_pipeline(path: str, edit=None, *, run_slice: bool = True, reload_gui: bool = False,
+                 confirm_close_unsaved: bool = False, auto_arrange: bool = True, normalize: bool = True,
+                 machine: str = "", process: str = "", filament: str = "", extra: dict | None = None) -> dict:
+    """Pipeline comune: copia di lavoro -> modifica (edit(Project, report) -> bool) -> controllo layout
+    (con ridisposizione automatica) -> export CLI (miniature) -> slicing -> backup e salvataggio -> GUI."""
     cfg = load_config()
-    src = Path(os.path.expandvars(threemf_path.strip().strip('"'))).expanduser().resolve()
-    if not src.exists():
-        raise FileNotFoundError(f"File non trovato: {src}")
-    if isinstance(settings_patch, str):
-        settings_patch = json.loads(settings_patch) if settings_patch.strip() else {}
-    patch = dict(settings_patch or {})
+    src = _resolve(path)
     report: dict[str, Any] = {"input": str(src)}
+    if extra:
+        report.update(extra)
     work = _new_workdir(_slug(src.stem)[:30])
     ok = False
+    saved = False
     try:
-        is_raw_ext = src.suffix.lower() in RAW_EXTS
-        project_dst = src.with_suffix(".3mf") if is_raw_ext else src
-        ps = None if is_raw_ext else read_project_settings(src)
-        proj = work / "project.3mf"
-        if ps is None:
-            names = _profile_names(machine, process, filament)
-            tdir = ensure_template(names)
-            init = cli_init_project(src, tdir, work)
-            shutil.copy2(init, proj)
-            ps = read_project_settings(proj) or {}
-            # colore filamento dal preset + centratura sul piatto
-            flat_f = json.loads((tdir / "filament.json").read_text(encoding="utf-8"))
-            if flat_f.get("default_filament_colour"):
-                ps["filament_colour"] = flat_f["default_filament_colour"]
-            with zipfile.ZipFile(proj) as z:
-                model = z.read(MODEL_ENTRY).decode("utf-8")
-            c = _bed_center(ps)
-            if c:
-                model = center_build_items(model, *c)
-            rewrite_zip(proj, {PS_ENTRY: json.dumps(ps, indent=4, ensure_ascii=False).encode(),
-                               MODEL_ENTRY: model.encode()})
-            report["initialized_from_cad"] = {"profiles": names, "template_dir": str(tdir),
-                                              "bed_center": c}
-        else:
-            shutil.copy2(src, proj)
+        proj, project_dst, init = _prepare_project(src, work, machine, process, filament)
+        if init:
+            report["initialized_from_cad"] = init
+        changed = bool(init)
+        if edit is not None:
+            P = bp.Project(proj)
+            if edit(P, report, work):
+                changed = True
+                P.drop_stale_gcode()
+                P.save(proj)
+        # controllo sovrapposizioni / uscita dal piatto (prima dello slicing)
+        P = bp.Project(proj)
+        layout = P.layout_check()
+        if not layout["ok"] and auto_arrange and any(p["type"] in ("overlap", "outside_plate") for p in layout["problems"]):
+            plates = sorted({p["plate"] for p in layout["problems"] if p["type"] in ("overlap", "outside_plate")})
+            arr = {"plates": plates, "result": [P.arrange(pl, float(cfg["arrange_spacing_mm"])) for pl in plates],
+                   "problems_before": [p["message"] for p in layout["problems"]]}
+            P.drop_stale_gcode()
+            P.save(proj)
+            changed = True
+            report["auto_arrange"] = arr
+            layout = bp.Project(proj).layout_check()
+        report["layout_check"] = layout
+        if changed and normalize:
+            report["normalize"] = cli_normalize(proj, work)
         ps = read_project_settings(proj) or {}
         report["profiles_in_project"] = {"printer": ps.get("printer_settings_id"),
                                          "process": ps.get("print_settings_id"),
-                                         "filament": ps.get("filament_settings_id")}
-        repl: dict[str, bytes | None] = {}
-        if patch:
-            report["patch"] = apply_patch(ps, patch)
-            repl[PS_ENTRY] = json.dumps(ps, indent=4, ensure_ascii=False).encode()
-        if rotate_z_deg:
-            with zipfile.ZipFile(proj) as z:
-                model = z.read(MODEL_ENTRY).decode("utf-8")
-            model, n = rotate_build_items(model, float(rotate_z_deg))
-            repl[MODEL_ENTRY] = model.encode()
-            report["rotation"] = {"deg_z": rotate_z_deg, "items_rotated": n}
-        if repl:
-            with zipfile.ZipFile(proj) as z:
-                stale = [nm for nm in z.namelist() if re.fullmatch(r"Metadata/plate_\d+\.gcode(\.md5)?", nm)]
-            for nm in stale:  # G-code nel progetto non piu' valido
-                repl[nm] = None
-            rewrite_zip(proj, repl)
-
+                                         "filament": ps.get("filament_settings_id"),
+                                         "filament_colour": ps.get("filament_colour")}
         sliced_dst = _sliced_path_for(project_dst)
         sliced_tmp = None
-        if run_slice or rotate_z_deg:
+        if run_slice:
             sr = cli_slice(proj, sliced_dst.name, work)
             report["slice"] = sr
             if sr.get("ok"):
                 sliced_tmp = Path(sr.pop("sliced_file_tmp"))
-        report["overhang_analysis"] = analyze_overhangs(
-            proj, float(cfg["overhang_critical_angle_deg"]), float(cfg["overhang_warning_angle_deg"]))
+            else:
+                report["slice_failure"] = {"probable_causes": probable_cause(sr, layout)}
+        report["overhang_analysis"] = analyze_project_overhangs(proj, cfg)
 
         close_rep = gui_close_matching([project_dst, sliced_dst], confirm_close_unsaved) if reload_gui else None
-
-        if repl or "initialized_from_cad" in report:
+        if changed:
             if project_dst.exists():
                 report["backup"] = _backup(project_dst)
             _replace_with_retry(proj, project_dst)
+            saved = True
         report["project_file"] = str(project_dst)
+        report["project_saved"] = saved
         if sliced_tmp:
             _replace_with_retry(sliced_tmp, sliced_dst)
             report["sliced_file"] = str(sliced_dst)
+        if run_slice and not sliced_tmp:
+            report["slice_failure"]["message"] = (
+                ("Slicing fallito, MA il progetto e' stato salvato con le modifiche in " + str(project_dst))
+                if saved else "Slicing fallito; il progetto non e' stato modificato.") + \
+                (" Il vecchio .gcode.3mf (se esiste) NON e' aggiornato." if sliced_dst.exists() else "")
         if reload_gui:
-            report["gui"] = gui_reload(project_dst, Path(report["sliced_file"]) if sliced_tmp else None,
-                                       close_rep)
+            report["gui"] = gui_reload(project_dst, sliced_dst if sliced_tmp else None, close_rep)
             report["gui_summary"] = report["gui"].get("summary")
             report["unsaved_changes_found"] = bool(close_rep and close_rep.get("unsaved_changes_found"))
             if close_rep and close_rep.get("warnings"):
                 report["warnings"] = close_rep["warnings"]
             if close_rep and close_rep.get("needs_confirmation"):
                 report["needs_confirmation"] = True
-        ok = bool(not report.get("slice") or report["slice"].get("ok"))
+        ok = bool(not run_slice or sliced_tmp)
         report["ok"] = ok
         return report
     finally:
@@ -1429,13 +1419,83 @@ def process_3mf(threemf_path: str, settings_patch: dict | str | None, rotate_z_d
             shutil.rmtree(work, ignore_errors=True)
         else:
             report["work_dir_kept_for_debug"] = str(work)
-        # pulizia vecchie cartelle di lavoro
+            report.setdefault("project_saved", saved)
         try:
-            olds = sorted(WORK_DIR.glob("*"))
-            for o in olds[:-10]:
+            for o in sorted(WORK_DIR.glob("*"))[:-10]:
                 shutil.rmtree(o, ignore_errors=True)
         except Exception:
             pass
+
+
+def process_3mf(threemf_path: str, settings_patch: dict | str | None, rotate_z_deg: float = 0.0,
+                run_slice: bool = True, reload_gui: bool = False, machine: str = "", process: str = "",
+                filament: str = "", confirm_close_unsaved: bool = False, filament_profile: str = "",
+                filament_colour: str = "") -> dict:
+    if isinstance(settings_patch, str):
+        settings_patch = json.loads(settings_patch) if settings_patch.strip() else {}
+    patch = dict(settings_patch or {})
+
+    def edit(P: bp.Project, report: dict, work: Path) -> bool:
+        changed = False
+        if filament_profile:
+            report["filament_profile"] = apply_filament_profile(P.settings, filament_profile)
+            changed = True
+        if filament_colour:
+            n = len(P.settings.get("filament_settings_id") or [1])
+            P.settings["filament_colour"] = [filament_colour] * max(n, 1)
+            report["filament_colour"] = filament_colour
+            changed = True
+        if patch:
+            report["patch"] = apply_patch(P.settings, patch)
+            changed = changed or bool(report["patch"]["changed"])
+        if rotate_z_deg:
+            for o in P.objects():
+                P.rotate_world(o, rz=float(rotate_z_deg))
+            report["rotation"] = {"deg_z": rotate_z_deg, "objects": [o["name"] for o in P.objects()]}
+            changed = True
+        return changed
+
+    return run_pipeline(threemf_path, edit, run_slice=run_slice or bool(rotate_z_deg), reload_gui=reload_gui,
+                        confirm_close_unsaved=confirm_close_unsaved, machine=machine, process=process,
+                        filament=filament)
+
+
+_FIL_META = {"name", "inherits", "from", "type", "setting_id", "instantiation", "include", "version",
+             "description", "compatible_printers", "compatible_printers_condition", "compatible_prints",
+             "compatible_prints_condition", "filament_settings_id", "filament_id"}
+
+
+def apply_filament_profile(ps: dict, name: str) -> dict:
+    """Applica al progetto tutti i valori di un profilo filamento (sistema o utente), senza
+    toccare i default globali."""
+    idx = get_index()
+    if name not in idx.entries:
+        idx = get_index(refresh=True)
+    if idx.kind_of(name) != "filament":
+        sug = [e["name"] for e in idx.list("filament", name.split("@")[0].strip()[:12])][:8]
+        raise KeyError(f"Profilo filamento '{name}' non trovato. Simili: {sug}")
+    flat = idx.flatten(name)
+    n = len(ps.get("filament_settings_id") or [1]) or 1
+    changed = []
+    for k, v in flat.items():
+        if k in _FIL_META or k not in ps:
+            continue
+        nv = v if isinstance(v, list) else normalize_value(ps[k], v)
+        if isinstance(ps[k], list) and isinstance(nv, list) and len(nv) == 1 and n > 1:
+            nv = nv * n
+        if ps[k] != nv:
+            ps[k] = nv
+            changed.append(k)
+    ps["filament_settings_id"] = [name] * n
+    if flat.get("filament_id"):
+        ps["filament_ids"] = [flat["filament_id"]] * n
+    ig = ps.get("inherits_group")
+    if isinstance(ig, list) and len(ig) >= 2:
+        anc = idx.nearest_system_ancestor(name) if idx.entries[name]["source"] == "user" else ""
+        for i in range(1, len(ig) - 1):
+            ig[i] = anc
+    return {"profile": name, "keys_changed": len(changed),
+            "nozzle_temperature": ps.get("nozzle_temperature"), "textured_plate_temp": ps.get("textured_plate_temp")}
 
 
 def default_cad_patch(seam_position: str = "back", infill_percent: int = 18, bed_temp: int = 60,
@@ -1443,9 +1503,9 @@ def default_cad_patch(seam_position: str = "back", infill_percent: int = 18, bed
     notes = []
     if not 15 <= infill_percent <= 20:
         notes.append(f"infill_percent={infill_percent} fuori dal range consigliato 15-20%")
-    if not 55 <= bed_temp <= 60:
+    if bed_temp and not 55 <= bed_temp <= 60:
         notes.append(f"bed_temp={bed_temp} fuori dal range consigliato 55-60 C")
-    if not 205 <= nozzle_temp <= 230:
+    if nozzle_temp and not 205 <= nozzle_temp <= 230:
         notes.append(f"nozzle_temp={nozzle_temp} insolita per Sunlu PLA Matte (205-230 C)")
     if seam_position not in ("aligned", "back", "nearest", "random"):
         notes.append(f"seam_position '{seam_position}' non standard (aligned/back/nearest/random)")
@@ -1468,6 +1528,12 @@ def default_cad_patch(seam_position: str = "back", infill_percent: int = 18, bed
         "brim_type": "no_brim",
         "elefant_foot_compensation": "0.15",
     }
+    if not bed_temp:  # 0 = mantieni le temperature del profilo filamento
+        for k in ("textured_plate_temp", "textured_plate_temp_initial_layer"):
+            patch.pop(k)
+    if not nozzle_temp:
+        for k in ("nozzle_temperature", "nozzle_temperature_initial_layer"):
+            patch.pop(k)
     return patch, notes
 
 
@@ -1478,12 +1544,15 @@ mcp = FastMCP(
     "bambu-live-mcp",
     instructions=(
         "Strumenti per configurare, slicare e mostrare dal vivo file .3mf in Bambu Studio (Windows). "
-        "Usa inspect_3mf_settings per scoprire le chiavi (project_settings.config), poi "
-        "apply_settings_and_preview con un dizionario settings_patch {chiave: valore}. I valori per "
-        "filamento possono essere scalari (applicati a tutti i filamenti) o liste. "
-        "apply_default_cad_preset applica il preset standard (0.2mm, Textured PEI, Arachne 3 pareti, "
-        "gyroid, niente supporti/brim). I .3mf grezzi dal CAD vengono inizializzati coi profili di "
-        "config.json (list_profiles / set_default_profiles per cambiarli, es. altra stampante)."
+        "Impostazioni: inspect_3mf_settings per le chiavi, apply_settings_and_preview con settings_patch "
+        "{chiave: valore}, apply_default_cad_preset per il preset standard (accetta filament_profile e "
+        "filament_colour). Oggetti e piatti: list_objects, replace_meshes (aggiorna la geometria dal CAD "
+        "mantenendo le impostazioni), merge_projects, add_plate, assign_to_plate, transform_object, "
+        "lay_on_face, arrange. Cucitura: seam_report (dal .gcode.3mf) e paint_seam. Ogni modifica controlla "
+        "sovrapposizioni/uscita dal piatto e ridispone da sola se serve. La GUI NON viene ricaricata di "
+        "default: usa reload_gui alla fine di piu' modifiche. Riferisci sempre all'utente warnings, "
+        "layout_check, slice_failure e overhang_analysis.verdict. Nomi di file/oggetti/piatti: esatti; "
+        "le coordinate dei box sono in mm sul piatto (origine nell'angolo del piatto)."
     ),
 )
 
@@ -1494,6 +1563,13 @@ def _truncate(v: Any, n: int = 160) -> Any:
     if isinstance(v, list):
         return [_truncate(x, n) for x in v]
     return v
+
+
+async def _run(fn, *a, **kw):
+    def go():
+        with _LOCK:
+            return fn(*a, **kw)
+    return await anyio.to_thread.run_sync(go)
 
 
 @mcp.tool()
@@ -1530,61 +1606,425 @@ async def inspect_3mf_settings(threemf_path: str, filter_keyword: str = "") -> d
             out["settings"] = {k: _truncate(ps[k], 80) for k in sorted(ps)}
         if p.suffix.lower() == ".3mf":
             with zipfile.ZipFile(p) as z:
-                names = z.namelist()
-                out["contains_gcode"] = any(re.fullmatch(r"Metadata/plate_\d+\.gcode", n) for n in names)
-                root = z.read(MODEL_ENTRY).decode("utf-8", "replace") if MODEL_ENTRY in names else ""
-                out["build_items"] = [_attrs(t).get("transform", "identity")
-                                      for t in re.findall(r"<item\b([^>]*)>", root)]
+                out["contains_gcode"] = any(re.fullmatch(r"Metadata/plate_\d+\.gcode", n) for n in z.namelist())
         return out
     return await anyio.to_thread.run_sync(run)
 
 
 @mcp.tool()
 async def apply_settings_and_preview(threemf_path: str, settings_patch: dict, rotate_z_deg: float = 0.0,
-                                     run_slice: bool = True, reload_gui: bool = True,
+                                     run_slice: bool = True, reload_gui: bool = False,
                                      confirm_close_unsaved: bool = False) -> dict:
     """Applica settings_patch (qualsiasi chiave di project_settings.config, es.
     {"wall_loops": 4, "sparse_infill_density": "20%", "nozzle_temperature": 215}) al .3mf.
-    - .3mf grezzo dal CAD (o .stl/.step): viene prima inizializzato con i profili base
-      (default Bambu Lab A1 0.4 + Sunlu PLA Matte) e centrato sul piatto.
-    - rotate_z_deg: ruota gli oggetti attorno all'asse Z (gradi, antiorario).
-    - run_slice (o rotazione): slicing headless -> <nome>.gcode.3mf con tempo stimato,
-      consumo filamento, avvisi dello slicer e analisi geometrica degli sbalzi.
-    - reload_gui: chiude SOLO la finestra di Bambu Studio che ha aperto questo file (chiusura
-      normale; se compare "Save" sceglie "No", perche' il file viene comunque sovrascritto) e lo
-      riapre in primo piano con l'anteprima aggiornata. Le altre finestre non vengono toccate.
-      Se una finestra con lo stesso nome ha modifiche non salvate ma il percorso non e' verificabile,
-      non viene chiusa: la risposta contiene needs_confirmation=true e warnings. Chiedi all'utente e,
-      solo se conferma, rilancia con confirm_close_unsaved=true.
-    Controlla sempre 'gui_summary' e 'warnings' nella risposta e riferiscili all'utente.
-    Un backup del progetto viene salvato in .bambu_mcp_backup."""
-    def run() -> dict:
-        with _LOCK:
-            return process_3mf(threemf_path, settings_patch, rotate_z_deg, run_slice, reload_gui,
-                               confirm_close_unsaved=confirm_close_unsaved)
-    return await anyio.to_thread.run_sync(run)
+    - .3mf grezzo dal CAD (o .stl/.step): viene prima inizializzato con i profili base e centrato.
+    - rotate_z_deg: ruota ogni oggetto attorno al proprio centro; se poi si sovrappongono o escono
+      dal piatto vengono ridisposti automaticamente (vedi auto_arrange nella risposta).
+    - run_slice: slicing headless -> <nome>.gcode.3mf, stime per piatto, avvisi, analisi sbalzi.
+      Se lo slicing fallisce la risposta dice se il progetto e' stato comunque salvato e la causa probabile.
+    - reload_gui (default false): chiude SOLO la finestra di Bambu Studio con questo file (su "Save"
+      sceglie "No") e la riapre. Le altre finestre non vengono toccate. Con needs_confirmation=true
+      chiedi all'utente e solo se conferma rilancia con confirm_close_unsaved=true.
+    Riferisci all'utente gui_summary, warnings e layout_check. Backup in .bambu_mcp_backup."""
+    return await _run(process_3mf, threemf_path, settings_patch, rotate_z_deg, run_slice, reload_gui,
+                      confirm_close_unsaved=confirm_close_unsaved)
 
 
 @mcp.tool()
 async def apply_default_cad_preset(threemf_path: str, seam_position: str = "back", infill_percent: int = 18,
-                                   bed_temp: int = 60, nozzle_temp: int = 215,
-                                   rotate_z_deg: float = 0.0, confirm_close_unsaved: bool = False) -> dict:
+                                   bed_temp: int = 60, nozzle_temp: int = 215, rotate_z_deg: float = 0.0,
+                                   filament_profile: str = "", filament_colour: str = "",
+                                   reload_gui: bool = False, confirm_close_unsaved: bool = False) -> dict:
     """Preset rapido per pezzi da CAD: layer 0.2 mm (anche primo layer), Textured PEI Plate a
-    bed_temp (55-60 C), ugello nozzle_temp (Sunlu PLA Matte), Arachne con 3 pareti, 5 strati
-    superiori / 4 inferiori, gyroid al infill_percent (15-20%), supporti OFF (con verifica sbalzi),
-    cucitura seam_position ('back' o 'aligned'), brim OFF, compensazione piede d'elefante 0.15 mm.
-    rotate_z_deg ruota il pezzo sull'asse Z (es. per allontanare la cucitura dalle linguette).
-    Poi slicing e ricarica della GUI (stesse regole di chiusura sicura di apply_settings_and_preview;
-    confirm_close_unsaved=true solo dopo conferma esplicita dell'utente)."""
+    bed_temp (55-60 C), ugello nozzle_temp, Arachne con 3 pareti, 5 strati superiori / 4 inferiori,
+    gyroid al infill_percent (15-20%), supporti OFF (con verifica sbalzi), cucitura seam_position
+    ('back' o 'aligned'), brim OFF, compensazione piede d'elefante 0.15 mm.
+    filament_profile: applica anche un profilo filamento (es. 'SUNLU PLA Matte @BBL A1' o un preset
+    utente) solo a questo progetto, senza cambiare i default globali; con bed_temp=0 / nozzle_temp=0
+    restano le temperature del profilo. filament_colour: es. '#000000'.
+    rotate_z_deg ruota i pezzi sull'asse Z (ridisposti se si sovrappongono). Poi slicing.
+    reload_gui di default false (usa il tool reload_gui alla fine)."""
     def run() -> dict:
         patch, notes = default_cad_patch(seam_position, infill_percent, bed_temp, nozzle_temp)
-        with _LOCK:
-            rep = process_3mf(threemf_path, patch, rotate_z_deg, True, True,
-                              confirm_close_unsaved=confirm_close_unsaved)
+        rep = process_3mf(threemf_path, patch, rotate_z_deg, True, reload_gui,
+                          confirm_close_unsaved=confirm_close_unsaved, filament_profile=filament_profile,
+                          filament_colour=filament_colour)
         if notes:
             rep["preset_notes"] = notes
         return rep
-    return await anyio.to_thread.run_sync(run)
+    return await _run(run)
+
+
+@mcp.tool()
+async def list_objects(project_3mf: str) -> dict:
+    """Piatti e oggetti del progetto: nome, piatto, ingombro sul piatto (mm), dimensioni, rotazione Z,
+    triangoli, piu' il controllo di sovrapposizioni / uscita dal piatto."""
+    def run() -> dict:
+        P = bp.Project(_resolve(project_3mf))
+        return {**P.summary(), "layout_check": P.layout_check()}
+    return await _run(run)
+
+
+@mcp.tool()
+async def replace_meshes(project_3mf: str, cad_3mf: str, match: str = "name", name_map: dict | None = None,
+                         run_slice: bool = True, reload_gui: bool = False) -> dict:
+    """Aggiorna la geometria del progetto con una nuova esportazione dal CAD mantenendo TUTTO il resto:
+    project_settings, piatto, posizione XY, rotazione e impostazioni per oggetto.
+    Gli oggetti vengono abbinati per nome (match='name': esatto, poi ignorando maiuscole/spazi/_);
+    name_map {nome_nel_progetto: nome_nel_cad} per abbinamenti espliciti. La nuova mesh viene
+    registrata su quella vecchia (le parti invariate restano ferme) e il pezzo riappoggiato al piatto.
+    Riporta abbinati, nuovi (solo nel CAD) e spariti (solo nel progetto) con suggerimenti."""
+    if match != "name":
+        raise ValueError("match supportato: 'name'")
+
+    def edit(P: bp.Project, report: dict, work: Path) -> bool:
+        cad_path = _resolve(cad_3mf)
+        cad = bp.cad_objects(cad_path)
+        nm = dict(name_map or {})
+        by_norm = {bp._norm_name(k): k for k in cad}
+        used, matched, missing = set(), [], []
+        for o in P.objects():
+            cname = nm.get(o["name"])
+            if cname is None:
+                cname = o["name"] if o["name"] in cad else by_norm.get(bp._norm_name(o["name"]))
+            if not cname or cname not in cad:
+                missing.append({"name": o["name"], "suggestions": difflib.get_close_matches(
+                    o["name"], [k for k in cad if k not in used], n=3, cutoff=0.3)})
+                continue
+            if len(o["components"]) != 1:
+                missing.append({"name": o["name"], "error": "oggetto multi-parte: sostituzione non supportata"})
+                continue
+            comp = o["components"][0]
+            old_mesh = P.mesh(comp["path"], comp["objectid"])
+            old_obj = old_mesh.transformed(comp["transform"])
+            new = cad[cname]
+            off, hits = bp.registration_offset(old_obj, new)
+            if hits < max(5, 0.05 * len(new.verts)):  # nessuna parte in comune: allinea i centri
+                olo, ohi = old_obj.bbox()
+                nlo, nhi = new.bbox()
+                off = tuple((olo[i] + ohi[i]) / 2 - (nlo[i] + nhi[i]) / 2 for i in range(3))
+                mode = "centro"
+            else:
+                mode = f"registrata ({hits} vertici coincidenti)"
+            new_obj = new.transformed(bp.translation(*off))
+            inv = bp.invert(comp["transform"])
+            new_local = new_obj.transformed(inv)
+            painted = old_mesh.has_paint()
+            P.set_mesh(comp["path"], comp["objectid"], new_local)
+            lo_b, hi_b = old_obj.bbox()
+            P.drop_to_bed(o)
+            lo_a, hi_a = new_obj.bbox()
+            ms = P._ms_object(o["id"])
+            if ms is not None:
+                for m in ms.findall("metadata"):
+                    if m.get("face_count") is not None:
+                        m.set("face_count", str(len(new.tris)))
+                for part in ms.findall("part"):
+                    st = part.find("mesh_stat")
+                    if st is not None:
+                        st.set("face_count", str(len(new.tris)))
+            used.add(cname)
+            entry = {"name": o["name"], "cad_name": cname, "plate": o["plate"], "alignment": mode,
+                     "triangles": [len(old_mesh.tris), len(new.tris)],
+                     "size_before_mm": [round(hi_b[i] - lo_b[i], 2) for i in range(3)],
+                     "size_after_mm": [round(hi_a[i] - lo_a[i], 2) for i in range(3)]}
+            if painted:
+                entry["warning"] = "la vecchia mesh aveva verniciature (cucitura/supporti/colore): perse"
+            matched.append(entry)
+        report["replace"] = {"cad_file": str(cad_path), "matched": matched, "missing_in_cad": missing,
+                             "new_in_cad": [k for k in cad if k not in used]}
+        return bool(matched)
+
+    return await _run(run_pipeline, project_3mf, edit, run_slice=run_slice, reload_gui=reload_gui)
+
+
+@mcp.tool()
+async def merge_projects(target_3mf: str, source_3mf: str, as_new_plate: bool = True, plate_name: str = "",
+                         target_plate: int = 1, run_slice: bool = True, reload_gui: bool = False) -> dict:
+    """Unisce gli oggetti di source_3mf (progetto Bambu o .3mf/.stl grezzo dal CAD) nel progetto target,
+    con le loro impostazioni per oggetto. as_new_plate=True: ogni piatto della sorgente diventa un nuovo
+    piatto (plate_name per il nome); altrimenti finiscono sul piatto target_plate e vengono ridisposti.
+    ID, UUID, origini dei piatti, filament_sequence e miniature vengono calcolati dal tool.
+    Le impostazioni di stampa restano quelle del target."""
+    def edit(P: bp.Project, report: dict, work: Path) -> bool:
+        sp = open_as_project(_resolve(source_3mf), work)
+        S = bp.Project(sp)
+        added = P.merge_from(S, as_new_plate=as_new_plate, plate_name=plate_name, target_plate=target_plate)
+        if not as_new_plate:
+            P.arrange(target_plate, float(load_config()["arrange_spacing_mm"]))
+        report["merged"] = {"source": str(_resolve(source_3mf)), "added": added,
+                            "plates": [{"index": p["index"], "name": p["name"]} for p in P.plates()]}
+        return True
+    return await _run(run_pipeline, target_3mf, edit, run_slice=run_slice, reload_gui=reload_gui)
+
+
+@mcp.tool()
+async def add_plate(project_3mf: str, name: str = "", run_slice: bool = False, reload_gui: bool = False) -> dict:
+    """Aggiunge un piatto vuoto (con nome). Le origini dei piatti vengono ricalcolate dal tool."""
+    def edit(P: bp.Project, report: dict, work: Path) -> bool:
+        idx = P.add_plate(name)
+        report["plate_added"] = {"index": idx, "name": name,
+                                 "plates": [{"index": p["index"], "name": p["name"]} for p in P.plates()]}
+        return True
+    return await _run(run_pipeline, project_3mf, edit, run_slice=run_slice, reload_gui=reload_gui)
+
+
+@mcp.tool()
+async def assign_to_plate(project_3mf: str, object_name: str, plate: int, plate_name: str = "",
+                          arrange: bool = True, run_slice: bool = True, reload_gui: bool = False) -> dict:
+    """Sposta un oggetto su un piatto (plate = numero; se plate e' il numero del piatto successivo
+    all'ultimo, il piatto viene creato con plate_name). arrange=True ridispone il piatto di arrivo."""
+    def edit(P: bp.Project, report: dict, work: Path) -> bool:
+        plates = [p["index"] for p in P.plates()]
+        if plate == max(plates) + 1:
+            P.add_plate(plate_name)
+        elif plate_name:
+            P.rename_plate(plate, plate_name)
+        o = P.find(object_name)
+        frm = o["plate"]
+        P.assign_to_plate(o, plate)
+        if arrange:
+            P.arrange(plate, float(load_config()["arrange_spacing_mm"]))
+        report["moved"] = {"name": o["name"], "from_plate": frm, "to_plate": plate}
+        return True
+    return await _run(run_pipeline, project_3mf, edit, run_slice=run_slice, reload_gui=reload_gui)
+
+
+@mcp.tool()
+async def transform_object(project_3mf: str, object_name: str, rotate_x: float = 0, rotate_y: float = 0,
+                           rotate_z: float = 0, run_slice: bool = True, reload_gui: bool = False) -> dict:
+    """Ruota un oggetto (gradi, assi del piatto, nell'ordine X, Y, Z) attorno al proprio centro e lo
+    riappoggia al piatto. Es. rotate_x=180 capovolge un coperchio. Se poi si sovrappone o esce dal
+    piatto il piatto viene ridisposto automaticamente."""
+    def edit(P: bp.Project, report: dict, work: Path) -> bool:
+        o = P.find(object_name)
+        P.rotate_world(o, rotate_x, rotate_y, rotate_z)
+        report["transformed"] = {"name": o["name"], "rotate": [rotate_x, rotate_y, rotate_z],
+                                 "bbox_on_plate": P.footprint(o)["bbox"]}
+        return True
+    return await _run(run_pipeline, project_3mf, edit, run_slice=run_slice, reload_gui=reload_gui)
+
+
+@mcp.tool()
+async def lay_on_face(project_3mf: str, object_name: str, face: str | list[float] = "largest_flat",
+                      run_slice: bool = True, reload_gui: bool = False) -> dict:
+    """Appoggia l'oggetto sul piatto con una faccia: face='largest_flat' sceglie la faccia piana esterna
+    piu' grande; oppure una normale [x, y, z] in coordinate del piatto (es. [0, 0, 1] = la faccia oggi
+    rivolta verso l'alto finisce sul piatto)."""
+    def edit(P: bp.Project, report: dict, work: Path) -> bool:
+        o = P.find(object_name)
+        wm = P.world_mesh(o)
+        if isinstance(face, str):
+            if face != "largest_flat":
+                raise ValueError("face: 'largest_flat' oppure una normale [x, y, z]")
+            n, area = _largest_outer_face(wm)
+        else:
+            n, area = tuple(float(x) for x in face), None
+        R = bp.rotation_between(n, (0, 0, -1))
+        lo, hi = wm.bbox()
+        c = tuple((lo[i] + hi[i]) / 2 for i in range(3))
+        P.set_transform(o, bp.compose(o["transform"], bp.about_point(R, c)))
+        P.drop_to_bed(o)
+        report["laid"] = {"name": o["name"], "face_normal": [round(x, 4) for x in n],
+                          "face_area_mm2": round(area, 1) if area else None,
+                          "bbox_on_plate": P.footprint(o)["bbox"]}
+        return True
+    return await _run(run_pipeline, project_3mf, edit, run_slice=run_slice, reload_gui=reload_gui)
+
+
+def _largest_outer_face(mesh: bp.Mesh) -> tuple[tuple, float]:
+    groups: dict[tuple, list] = {}
+    V = mesh.verts
+    for a, b, c in mesh.tris:
+        pa, pb, pc = V[a], V[b], V[c]
+        n = bp._cross((pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]), (pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]))
+        ln = math.sqrt(n[0] ** 2 + n[1] ** 2 + n[2] ** 2)
+        if ln < 1e-9:
+            continue
+        u = (round(n[0] / ln, 3), round(n[1] / ln, 3), round(n[2] / ln, 3))
+        d = round(u[0] * pa[0] + u[1] * pa[1] + u[2] * pa[2], 1)
+        g = groups.setdefault((u, d), [0.0])
+        g[0] += ln / 2
+    best = None
+    for (u, d), (area,) in sorted(groups.items(), key=lambda kv: -kv[1][0]):
+        ext = max(u[0] * v[0] + u[1] * v[1] + u[2] * v[2] for v in V)
+        if ext <= d + 0.1:  # faccia esterna (nessun punto oltre il suo piano)
+            best = (u, area)
+            break
+    if not best:
+        raise ValueError("nessuna faccia piana esterna trovata")
+    return best
+
+
+@mcp.tool()
+async def arrange(project_3mf: str, plate: int = 0, spacing_mm: float = 6.0, run_slice: bool = True,
+                  reload_gui: bool = False) -> dict:
+    """Dispone gli oggetti sul piatto (plate=0: tutti i piatti) senza sovrapposizioni, con spacing_mm
+    di distanza, centrati sul piatto. Non ruota i pezzi."""
+    def edit(P: bp.Project, report: dict, work: Path) -> bool:
+        report["arrange"] = P.arrange(plate or None, float(spacing_mm))
+        return True
+    return await _run(run_pipeline, project_3mf, edit, run_slice=run_slice, reload_gui=reload_gui)
+
+
+@mcp.tool()
+async def paint_seam(project_3mf: str, object_name: str, box: list[float], mode: str = "block",
+                     run_slice: bool = True, reload_gui: bool = False) -> dict:
+    """Vernicia la cucitura di un oggetto: mode 'enforce' (metti la cucitura qui), 'block' (mai qui) o
+    'clear'. box = [xmin, ymin, zmin, xmax, ymax, zmax] in mm sul piatto dell'oggetto (stesse coordinate
+    di list_objects.bbox_on_plate e di seam_report). Vengono marcati i triangoli il cui baricentro cade
+    nel box (le mesh CAD hanno triangoli grandi: usa box generosi). Verifica poi con seam_report."""
+    if mode not in ("enforce", "block", "clear"):
+        raise ValueError("mode: enforce | block | clear")
+
+    def edit(P: bp.Project, report: dict, work: Path) -> bool:
+        o = P.find(object_name)
+        if len(o["components"]) != 1:
+            raise ValueError("oggetto multi-parte non supportato")
+        comp = o["components"][0]
+        mesh = P.mesh(comp["path"], comp["objectid"])
+        ox, oy = P.plate_origin(o["plate"])
+        world_box = [box[0] + ox, box[1] + oy, box[2], box[3] + ox, box[4] + oy, box[5]]
+        n = bp.paint_seam(mesh, bp.compose(comp["transform"], o["transform"]), world_box, mode)
+        P.set_mesh(comp["path"], comp["objectid"], mesh)
+        report["seam_paint"] = {"name": o["name"], "mode": mode, "box": box, "triangles": n}
+        if n == 0:
+            report["seam_paint"]["warning"] = "nessun triangolo nel box: controlla le coordinate con list_objects"
+        return n > 0
+    return await _run(run_pipeline, project_3mf, edit, run_slice=run_slice, reload_gui=reload_gui)
+
+
+@mcp.tool()
+async def seam_report(gcode_3mf: str, band_mm: float = 5.0, avoid_box: list[float] | None = None,
+                      avoid_plate: int = 0) -> dict:
+    """Dove cade la cucitura, letto dal G-code del .gcode.3mf: per piatto, oggetto e fascia di altezza
+    (band_mm) la posizione XY tipica (mediana, mm sul piatto), la dispersione e il lato dell'oggetto.
+    avoid_box [xmin, ymin, zmin, xmax, ymax, zmax] (mm sul piatto, piatto avoid_plate o tutti):
+    conta le cuciture che cadono nella zona da evitare."""
+    def run() -> dict:
+        path = _resolve(gcode_3mf)
+        if not path.name.lower().endswith(".gcode.3mf"):
+            sliced = _sliced_path_for(path)
+            if sliced.exists():
+                path = sliced
+        P = bp.Project(path)
+        fps = {o["id"]: (o, P.footprint(o)) for o in P.objects()}
+        out = {"file": str(path), "plates": []}
+        with zipfile.ZipFile(path) as z:
+            for name in sorted(n for n in z.namelist() if re.fullmatch(r"Metadata/plate_\d+\.gcode", n)):
+                pl = int(re.search(r"plate_(\d+)", name).group(1))
+                with z.open(name) as f:
+                    pts = bp.seam_points(line.decode("utf-8", "replace") for line in f)
+                objs = [(o, fp) for o, fp in fps.values() if o["plate"] == pl]
+                per: dict[str, list] = {}
+                for x, y, zz in pts:
+                    best = None
+                    for o, fp in objs:
+                        h = fp["hull"]
+                        dist = _dist_to_hull(h, x, y)
+                        if best is None or dist < best[0]:
+                            best = (dist, o["name"], fp)
+                    if best and best[0] <= 2.0:
+                        per.setdefault(best[1], []).append((x, y, zz))
+                plate_rep = {"plate": pl, "seams_total": len(pts), "objects": []}
+                for oname, lst in per.items():
+                    fp = next(fp for o, fp in objs if o["name"] == oname)
+                    bands = {}
+                    for x, y, zz in lst:
+                        bands.setdefault(int(zz // band_mm), []).append((x, y))
+                    brep = []
+                    for k in sorted(bands):
+                        clusters = _seam_clusters(bands[k], 2.0)
+                        brep.append({"z_from": round(k * band_mm, 2), "z_to": round((k + 1) * band_mm, 2),
+                                     "count": len(bands[k]),
+                                     "positions": [{"xy": [round(cx, 2), round(cy, 2)], "count": n,
+                                                    "side": _side(fp["bbox"], cx, cy)}
+                                                   for cx, cy, n in clusters[:6]],
+                                     "other_positions": max(0, len(clusters) - 6)})
+                    orep = {"name": oname, "seams": len(lst), "bbox_on_plate": fp["bbox"], "bands": brep}
+                    if avoid_box and (not avoid_plate or avoid_plate == pl):
+                        b = avoid_box
+                        inside = [p for p in lst if b[0] <= p[0] <= b[3] and b[1] <= p[1] <= b[4] and b[2] <= p[2] <= b[5]]
+                        orep["in_avoid_box"] = len(inside)
+                        orep["in_avoid_box_examples"] = [[round(v, 2) for v in p] for p in inside[:5]]
+                    plate_rep["objects"].append(orep)
+                out["plates"].append(plate_rep)
+        if avoid_box:
+            tot = sum(o.get("in_avoid_box", 0) for p in out["plates"] for o in p["objects"])
+            out["avoid_box_ok"] = tot == 0
+            out["avoid_box_seams"] = tot
+        return out
+    return await _run(run)
+
+
+def _seam_clusters(pts: list[tuple], radius: float) -> list[tuple[float, float, int]]:
+    """Raggruppa le cuciture vicine (ogni foro/isola ha la sua): [(x, y, conteggio)] dal piu' frequente."""
+    cl: list[list] = []
+    for x, y in pts:
+        for c in cl:
+            if math.hypot(x - c[0] / c[2], y - c[1] / c[2]) <= radius:
+                c[0] += x
+                c[1] += y
+                c[2] += 1
+                break
+        else:
+            cl.append([x, y, 1])
+    return sorted(((c[0] / c[2], c[1] / c[2], c[2]) for c in cl), key=lambda t: -t[2])
+
+
+def _dist_to_hull(h: list[tuple], x: float, y: float) -> float:
+    if len(h) < 3:
+        return min((math.hypot(x - a, y - b) for a, b in h), default=1e9)
+    inside = True
+    best = 1e9
+    for i in range(len(h)):
+        (x1, y1), (x2, y2) = h[i], h[(i + 1) % len(h)]
+        if (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1) < 0:
+            inside = False
+        dx, dy = x2 - x1, y2 - y1
+        t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / ((dx * dx + dy * dy) or 1)))
+        best = min(best, math.hypot(x - (x1 + t * dx), y - (y1 + t * dy)))
+    return 0.0 if inside else best
+
+
+def _side(bb: list[float], x: float, y: float) -> str:
+    cx, cy = (bb[0] + bb[3]) / 2, (bb[1] + bb[4]) / 2
+    hw, hd = max((bb[3] - bb[0]) / 2, 1e-6), max((bb[4] - bb[1]) / 2, 1e-6)
+    u, v = (x - cx) / hw, (y - cy) / hd
+    parts = []
+    if v > 0.5:
+        parts.append("retro (+Y)")
+    elif v < -0.5:
+        parts.append("fronte (-Y)")
+    if u > 0.5:
+        parts.append("destra (+X)")
+    elif u < -0.5:
+        parts.append("sinistra (-X)")
+    return " / ".join(parts) or "centro"
+
+
+@mcp.tool()
+async def reload_gui(project_3mf: str, confirm_close_unsaved: bool = False) -> dict:
+    """Ricarica Bambu Studio una volta sola (es. alla fine di piu' modifiche): chiude solo la finestra
+    con questo progetto (regole di chiusura sicura) e riapre il .gcode.3mf se e' piu' recente del
+    progetto, altrimenti il progetto."""
+    def run() -> dict:
+        project = _resolve(project_3mf)
+        if project.name.lower().endswith(".gcode.3mf"):
+            sliced = project
+            stem = project.name[: -len(".gcode.3mf")]
+            project = project.with_name(stem + ".3mf")
+        else:
+            sliced = _sliced_path_for(project)
+        fresh = sliced.exists() and (not project.exists() or sliced.stat().st_mtime >= project.stat().st_mtime - 1)
+        close_rep = gui_close_matching([project, sliced], confirm_close_unsaved)
+        rep = gui_reload(project if project.exists() else sliced, sliced if fresh else None, close_rep)
+        if not fresh and sliced.exists():
+            rep["note"] = "Il .gcode.3mf e' piu' vecchio del progetto: apro il progetto (rilancia lo slicing per l'anteprima)."
+        rep["warnings"] = close_rep.get("warnings")
+        rep["needs_confirmation"] = close_rep.get("needs_confirmation")
+        return rep
+    return await _run(run)
 
 
 @mcp.tool()
@@ -1602,18 +2042,17 @@ async def list_profiles(kind: str = "", keyword: str = "", refresh: bool = False
 
 @mcp.tool()
 async def set_default_profiles(machine: str = "", process: str = "", filament: str = "") -> dict:
-    """Cambia i profili base usati per inizializzare i .3mf grezzi (es. un'altra stampante:
+    """Cambia i profili base usati per inizializzare i FUTURI .3mf grezzi (es. un'altra stampante:
     machine='Bambu Lab P1S 0.4 nozzle', process='0.20mm Standard @BBL X1C', filament='Bambu PLA Basic @BBL X1C').
-    Campi vuoti = invariati. Rigenera e verifica il template tramite la CLI."""
+    Campi vuoti = invariati. Per cambiare filamento a un solo progetto usa apply_default_cad_preset(filament_profile=...)."""
     def run() -> dict:
-        with _LOCK:
-            names = _profile_names(machine, process, filament)
-            tdir = ensure_template(names, force=True)
-            cfg = load_config()
-            cfg["profiles"] = names
-            save_config(cfg)
-            return {"ok": True, "profiles": names, "template_dir": str(tdir)}
-    return await anyio.to_thread.run_sync(run)
+        names = _profile_names(machine, process, filament)
+        tdir = ensure_template(names, force=True)
+        cfg = load_config()
+        cfg["profiles"] = names
+        save_config(cfg)
+        return {"ok": True, "profiles": names, "template_dir": str(tdir)}
+    return await _run(run)
 
 
 # --------------------------------------------------------------------------------------

@@ -13,5 +13,7 @@
   "slice_timeout_s": 900,
   "backups_to_keep": 10,
   "overhang_critical_angle_deg": 30,
-  "overhang_warning_angle_deg": 45
+  "overhang_warning_angle_deg": 45,
+  "bridge_ok_span_mm": 15,
+  "arrange_spacing_mm": 6
 }
