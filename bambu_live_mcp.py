@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -55,7 +56,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     # Secondi di attesa per la chiusura pulita (WM_CLOSE) di Bambu Studio
     "gui_close_timeout_s": 12,
-    # Se Bambu Studio non si chiude (es. dialogo "salvare modifiche?") lo termina
+    # Se la finestra del file del tool non si chiude entro il timeout, termina SOLO quel processo
+    # (mai istanze con altri progetti o con modifiche non confermate) e ne cancella i dati di ripristino
     "gui_force_kill_on_timeout": True,
     # Se Bambu Studio ha aperto un ALTRO progetto: "skip" (non toccare) | "open" (apri comunque)
     "gui_when_other_project_open": "open",
@@ -759,6 +761,10 @@ def run_cli(args: list[str], outdir: Path, timeout: int | None = None) -> dict:
         rc, so, se = p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired as e:
         rc, so, se = -999, str(e.stdout or ""), "timeout"
+    try:  # la CLI lascia cartelle di ripristino in %TEMP%amboo_model: rimuovile
+        clear_recovery_data(origin_under=[WORK_DIR, TEMPLATES_DIR])
+    except Exception as e:
+        log(f"pulizia dati di ripristino CLI fallita: {e}")
     result = {}
     rj = outdir / "result.json"
     if rj.exists():
@@ -976,34 +982,250 @@ def _foreground(hwnd: int) -> None:
         log(f"foreground fallito: {e}")
 
 
-def gui_close_matching(paths: list[Path]) -> dict:
-    cfg = load_config()
-    stems = _stems(*paths)
+# ---- dati di ripristino di Bambu Studio ----------------------------------------------
+# Ogni istanza (GUI o CLI) crea %TEMP%\bamboo_model\<giorno>\<ora>#<pid>#<n>\ con lock.txt (pid)
+# e origin.txt (file aperto). Se il processo muore lasciando la cartella con un backup ".3mf",
+# al riavvio Bambu Studio propone di ripristinare il progetto.
+def _recovery_roots() -> list[Path]:
+    tmp = Path(tempfile.gettempdir())
+    return [tmp / "bamboo_model", tmp / "bambu_model"]
+
+
+def recovery_entries() -> list[dict]:
+    out = []
+    for root in _recovery_roots():
+        if not root.is_dir():
+            continue
+        for d in root.glob("*/*"):
+            if not d.is_dir():
+                continue
+            pid = None
+            m = re.search(r"#(\d+)#", d.name)
+            try:
+                pid = int((d / "lock.txt").read_text(encoding="utf-8", errors="replace").strip() or 0) or None
+            except (OSError, ValueError):
+                pid = int(m.group(1)) if m else None
+            try:
+                origin = (d / "origin.txt").read_text(encoding="utf-8", errors="replace").strip() or None
+            except OSError:
+                origin = None
+            out.append({"dir": d, "pid": pid, "origin": origin, "has_backup": (d / ".3mf").exists(),
+                        "mtime": d.stat().st_mtime})
+    return out
+
+
+def _norm(p: str | Path) -> str:
+    return os.path.normcase(os.path.abspath(str(p)))
+
+
+def _path_under(p: str, roots: list[Path]) -> bool:
+    np_ = _norm(p)
+    return any(np_.startswith(_norm(r) + os.sep) for r in roots)
+
+
+def origin_of_pid(pid: int) -> str | None:
+    cand = [e for e in recovery_entries() if e["pid"] == pid and e["origin"]]
+    return max(cand, key=lambda e: e["mtime"])["origin"] if cand else None
+
+
+def clear_recovery_data(pids: list[int] | None = None, origin_under: list[Path] | None = None) -> list[str]:
+    """Cancella le cartelle di ripristino di processi NON piu' in esecuzione che appartengono
+    ai pid indicati oppure a file dentro origin_under (es. le cartelle di lavoro della CLI)."""
+    alive = set(_bambu_pids())
+    removed = []
+    for e in recovery_entries():
+        if e["pid"] in alive:
+            continue
+        hit = bool(pids and e["pid"] in pids)
+        if not hit and origin_under and e["origin"]:
+            hit = _path_under(e["origin"], origin_under)
+        if hit:
+            shutil.rmtree(e["dir"], ignore_errors=True)
+            if not e["dir"].exists():
+                removed.append(str(e["dir"]))
+    return removed
+
+
+# ---- finestre ------------------------------------------------------------------------
+_MAIN_TITLE_RE = re.compile(r"^(?P<name>.*?)\s+-\s+BambuStudio\s*$", re.I)
+_SAVE_DIALOG_RE = re.compile(r"-\s*(save|salva)\b|unsaved changes|modifiche non salvate", re.I)
+_DISCARD_LABELS = {"no", "don't save", "dont save", "do not save", "discard", "non salvare", "scarta",
+                   "no, non salvare", "don't save all", "discard all"}
+_CANCEL_LABELS = {"cancel", "annulla"}
+
+
+def _win_text(h: int) -> str:
+    n = user32.GetWindowTextLengthW(h)
+    buf = ctypes.create_unicode_buffer(n + 1)
+    user32.GetWindowTextW(h, buf, n + 1)
+    return buf.value
+
+
+def _win_class(h: int) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(h, buf, 256)
+    return buf.value
+
+
+def _children(h: int) -> list[tuple[int, str, str]]:
+    out: list[tuple[int, str, str]] = []
+    EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(c, _):
+        if user32.IsWindowVisible(c):
+            out.append((c, _win_class(c), _win_text(c)))
+        return True
+
+    user32.EnumChildWindows(h, EnumProc(cb), 0)
+    return out
+
+
+def _click(h: int) -> None:
+    """Click sintetico inviato alla finestra (nessun movimento reale di mouse/tastiera)."""
+    r = wintypes.RECT()
+    user32.GetClientRect(h, ctypes.byref(r))
+    lp = ((r.bottom // 2) << 16) | (r.right // 2)
+    user32.PostMessageW(h, 0x0201, 1, lp)  # WM_LBUTTONDOWN
+    time.sleep(0.05)
+    user32.PostMessageW(h, 0x0202, 0, lp)  # WM_LBUTTONUP
+
+
+def _dialog_button(dlg: int, labels: set[str]) -> tuple[int, str] | None:
+    for c, _cls, txt in _children(dlg):
+        norm = txt.strip().lower().replace("’", "'").replace("&", "")
+        if norm in labels:
+            return c, txt
+    return None
+
+
+def _project_name_from_title(name: str) -> tuple[str, bool]:
+    unsaved = name.startswith("*") or name.endswith("*")
+    return name.strip("* ").strip(), unsaved
+
+
+def bambu_instances() -> list[dict]:
+    """Istanze di Bambu Studio in esecuzione, con progetto aperto e stato 'modifiche non salvate'."""
     pids = _bambu_pids()
     wins = _windows_of(pids)
-    report: dict[str, Any] = {"bambu_running": bool(pids), "windows": [w[1] for w in wins]}
-    match = [w for w in wins if any(s and s in w[1].lower() for s in stems)]
-    report["matched_file"] = bool(match)
-    if not pids:
-        return report
-    if not match:
-        report["other_project_open"] = True
-        return report
-    for hwnd, _, _ in match:
-        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+    out = []
+    for pid in pids:
+        mine = [w for w in wins if w[2] == pid]
+        main = next((w for w in mine if _MAIN_TITLE_RE.match(w[1]) and _win_class(w[0]) == "wxWindowNR"), None)
+        inst: dict[str, Any] = {"pid": pid, "hwnd": main[0] if main else None,
+                                "title": main[1] if main else None,
+                                "dialogs": [w[1] for w in mine if not main or w[0] != main[0]],
+                                "origin": origin_of_pid(pid)}
+        if main:
+            inst["project_name"], inst["unsaved"] = _project_name_from_title(_MAIN_TITLE_RE.match(main[1])["name"])
+        else:
+            inst["project_name"], inst["unsaved"] = None, False
+        out.append(inst)
+    return out
+
+
+def _relation(inst: dict, targets: list[Path]) -> str:
+    """'target' = ha aperto esattamente un file che il tool sovrascrive;
+    'ambiguous' = stesso nome ma percorso diverso/sconosciuto; 'other' = altro progetto."""
+    if inst.get("origin") and any(_norm(inst["origin"]) == _norm(t) for t in targets):
+        return "target"
+    name = inst.get("project_name") or ""
+    if name and _stems(Path(name + ".3mf"))[0] in _stems(*targets):  # "X.gcode" -> "x"
+        return "ambiguous"
+    return "other"
+
+
+def _close_instance(inst: dict, discard_ok: bool, cfg: dict) -> dict:
+    pid = inst["pid"]
+    r: dict[str, Any] = {"save_dialog_seen": False, "discarded_unsaved_changes": False}
+    if not inst.get("hwnd"):
+        r["action"] = "no_main_window"
+        return r
+    user32.PostMessageW(inst["hwnd"], WM_CLOSE, 0, 0)
     deadline = time.time() + float(cfg["gui_close_timeout_s"])
-    while time.time() < deadline and _bambu_pids():
+    while time.time() < deadline:
+        if pid not in _bambu_pids():
+            break
+        for h, title, _ in _windows_of([pid]):
+            if not _SAVE_DIALOG_RE.search(title):
+                continue  # es. "New version of Bambu Studio": non blocca la chiusura
+            r["save_dialog_seen"] = True
+            if discard_ok:
+                btn = _dialog_button(h, _DISCARD_LABELS)
+                if btn:
+                    _click(btn[0])
+                    r["discarded_unsaved_changes"] = True
+                    r["clicked"] = f"{title}: {btn[1]}"
+            else:
+                btn = _dialog_button(h, _CANCEL_LABELS)
+                if btn:
+                    _click(btn[0])
+                r["action"] = "left_open_save_dialog_cancelled"
+                return r
         time.sleep(0.4)
-    if _bambu_pids():
-        left = [w[1] for w in _windows_of(_bambu_pids())]
-        report["still_open_after_close"] = left
-        if cfg["gui_force_kill_on_timeout"]:
-            for pid in _bambu_pids():
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True,
-                               creationflags=CREATE_NO_WINDOW)
-            time.sleep(1.0)
-            report["force_killed"] = True
-    report["closed"] = not _bambu_pids()
+    if pid not in _bambu_pids():
+        r["action"] = "closed_discarding_unsaved_changes" if r["discarded_unsaved_changes"] else "closed"
+    elif cfg["gui_force_kill_on_timeout"] and (discard_ok or not inst.get("unsaved")):
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, creationflags=CREATE_NO_WINDOW)
+        for _ in range(20):
+            if pid not in _bambu_pids():
+                break
+            time.sleep(0.25)
+        r["action"] = "force_killed"
+        r["still_open_windows"] = [w[1] for w in _windows_of([pid])]
+    else:
+        r["action"] = "left_open_timeout"
+        r["still_open_windows"] = [w[1] for w in _windows_of([pid])]
+    if pid not in _bambu_pids():
+        # niente prompt "ripristinare il progetto?" al prossimo avvio
+        r["recovery_data_removed"] = clear_recovery_data(pids=[pid])
+    return r
+
+
+def gui_close_matching(paths: list[Path], confirm_close_unsaved: bool = False) -> dict:
+    """Chiude SOLO le istanze di Bambu Studio che hanno aperto i file che il tool sta per
+    sovrascrivere. Le altre (anche con modifiche non salvate) non vengono toccate."""
+    cfg = load_config()
+    report: dict[str, Any] = {"instances": [], "warnings": [], "needs_confirmation": False,
+                              "unsaved_changes_found": False}
+    insts = bambu_instances()
+    report["bambu_running"] = bool(insts)
+    for inst in insts:
+        rel = _relation(inst, paths)
+        entry = {"pid": inst["pid"], "title": inst["title"], "file": inst["origin"] or inst["project_name"],
+                 "relation": rel, "unsaved_changes": inst["unsaved"], "other_dialogs": inst["dialogs"]}
+        report["instances"].append(entry)
+        if inst["unsaved"]:
+            report["unsaved_changes_found"] = True
+        if rel == "other":
+            entry["action"] = "left_open_other_project"
+            if inst["unsaved"]:
+                report["warnings"].append(
+                    f"'{inst['title']}' ha modifiche non salvate e non e' il file del tool: lasciata aperta.")
+            continue
+        if rel == "ambiguous" and inst["unsaved"] and not confirm_close_unsaved:
+            entry["action"] = "left_open_needs_confirmation"
+            report["needs_confirmation"] = True
+            report["warnings"].append(
+                f"'{inst['title']}' ha modifiche non salvate e non posso verificare che sia proprio "
+                f"{paths[0].name}: NON chiusa. Salva/chiudi a mano oppure rilancia con "
+                f"confirm_close_unsaved=true per chiuderla scartando le modifiche.")
+            continue
+        entry.update(_close_instance(inst, discard_ok=(rel == "target" or confirm_close_unsaved), cfg=cfg))
+        if entry["action"] == "force_killed":
+            lost = " Le modifiche non salvate sono andate perse." if inst["unsaved"] else ""
+            report["warnings"].append(
+                f"'{inst['title']}' non si chiudeva: processo {inst['pid']} terminato, dati di ripristino "
+                f"rimossi.{lost}")
+        elif entry.get("discarded_unsaved_changes"):
+            report["warnings"].append(
+                f"'{inst['title']}' aveva modifiche non salvate: scartate (il file viene sovrascritto dal tool, "
+                f"backup in .bambu_mcp_backup).")
+        elif entry["action"].startswith("left_open"):
+            report["warnings"].append(f"'{inst['title']}' non si e' chiusa ({entry['action']}).")
+    report["target_open"] = any(e["relation"] != "other" for e in report["instances"])
+    report["other_project_open"] = any(e["relation"] == "other" for e in report["instances"])
+    report["target_still_open"] = any(e["relation"] != "other" and e.get("action", "").startswith("left_open")
+                                      for e in report["instances"])
     return report
 
 
@@ -1017,35 +1239,58 @@ def gui_open(path: Path, wait_s: float = 45) -> dict:
               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     try:  # esci dal job object del client MCP, cosi' la GUI sopravvive al riavvio del server
-        subprocess.Popen([str(exe), str(path)], creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kw)
+        proc = subprocess.Popen([str(exe), str(path)], creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kw)
     except OSError:
-        subprocess.Popen([str(exe), str(path)], creationflags=flags, **kw)
+        proc = subprocess.Popen([str(exe), str(path)], creationflags=flags, **kw)
     stem = _stems(path)[0]
     deadline = time.time() + wait_s
     hit = None
     while time.time() < deadline:
-        wins = _windows_of(_bambu_pids())
-        hit = next((w for w in wins if stem in w[1].lower()), None)
+        wins = _windows_of([proc.pid])
+        hit = next((w for w in wins if _MAIN_TITLE_RE.match(w[1]) and stem in w[1].lower()), None)
         if hit:
             break
         time.sleep(0.7)
     if hit:
         time.sleep(0.8)
         _foreground(hit[0])
-    return {"opened": str(path), "window_title": hit[1] if hit else None,
+    return {"opened": str(path), "pid": proc.pid, "window_title": hit[1] if hit else None,
             "window_found": bool(hit)}
 
 
 def gui_reload(project: Path, sliced: Path | None, pre_close_report: dict | None) -> dict:
     cfg = load_config()
     target = sliced if (sliced and sliced.exists() and cfg["gui_open_target"] == "sliced") else project
-    rep = {"close": pre_close_report}
-    if pre_close_report and pre_close_report.get("other_project_open") and \
+    rep: dict[str, Any] = {"close": pre_close_report}
+    pc = pre_close_report or {}
+    if pc.get("target_still_open"):
+        rep["open"] = {"skipped": "Una finestra con questo file e' ancora aperta (vedi warnings): non apro un duplicato."}
+    elif pc.get("other_project_open") and not pc.get("target_open") and \
             cfg["gui_when_other_project_open"] == "skip":
         rep["open"] = {"skipped": "Bambu Studio ha un altro progetto aperto (gui_when_other_project_open=skip)"}
-        return rep
-    rep["open"] = gui_open(target)
+    else:
+        rep["open"] = gui_open(target)
+    rep["summary"] = _gui_summary(rep)
     return rep
+
+
+def _gui_summary(rep: dict) -> list[str]:
+    out = []
+    pc = rep.get("close") or {}
+    names = {"closed": "chiusa normalmente", "closed_discarding_unsaved_changes": "chiusa scartando le modifiche non salvate",
+             "force_killed": "terminata forzatamente (dati di ripristino rimossi)",
+             "left_open_other_project": "lasciata aperta (altro progetto)",
+             "left_open_needs_confirmation": "lasciata aperta: serve conferma",
+             "left_open_timeout": "lasciata aperta: non si e' chiusa in tempo",
+             "left_open_save_dialog_cancelled": "lasciata aperta: dialogo Save annullato"}
+    for e in pc.get("instances", []):
+        st = "con modifiche non salvate" if e.get("unsaved_changes") else "senza modifiche non salvate"
+        out.append(f"{e.get('title') or 'pid ' + str(e['pid'])} ({st}): {names.get(e.get('action'), e.get('action'))}")
+    if not pc.get("instances"):
+        out.append("Nessuna istanza di Bambu Studio aperta.")
+    op = rep.get("open") or {}
+    out.append(f"Riaperto: {op['window_title'] or op['opened']}" if op.get("opened") else f"Non riaperto: {op.get('skipped')}")
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -1088,7 +1333,7 @@ def _replace_with_retry(src: Path, dst: Path, tries: int = 10) -> None:
 
 def process_3mf(threemf_path: str, settings_patch: dict | str | None, rotate_z_deg: float = 0.0,
                 run_slice: bool = True, reload_gui: bool = True, machine: str = "", process: str = "",
-                filament: str = "") -> dict:
+                filament: str = "", confirm_close_unsaved: bool = False) -> dict:
     cfg = load_config()
     src = Path(os.path.expandvars(threemf_path.strip().strip('"'))).expanduser().resolve()
     if not src.exists():
@@ -1156,7 +1401,7 @@ def process_3mf(threemf_path: str, settings_patch: dict | str | None, rotate_z_d
         report["overhang_analysis"] = analyze_overhangs(
             proj, float(cfg["overhang_critical_angle_deg"]), float(cfg["overhang_warning_angle_deg"]))
 
-        close_rep = gui_close_matching([project_dst, sliced_dst]) if reload_gui else None
+        close_rep = gui_close_matching([project_dst, sliced_dst], confirm_close_unsaved) if reload_gui else None
 
         if repl or "initialized_from_cad" in report:
             if project_dst.exists():
@@ -1169,6 +1414,12 @@ def process_3mf(threemf_path: str, settings_patch: dict | str | None, rotate_z_d
         if reload_gui:
             report["gui"] = gui_reload(project_dst, Path(report["sliced_file"]) if sliced_tmp else None,
                                        close_rep)
+            report["gui_summary"] = report["gui"].get("summary")
+            report["unsaved_changes_found"] = bool(close_rep and close_rep.get("unsaved_changes_found"))
+            if close_rep and close_rep.get("warnings"):
+                report["warnings"] = close_rep["warnings"]
+            if close_rep and close_rep.get("needs_confirmation"):
+                report["needs_confirmation"] = True
         ok = bool(not report.get("slice") or report["slice"].get("ok"))
         report["ok"] = ok
         return report
@@ -1289,7 +1540,8 @@ async def inspect_3mf_settings(threemf_path: str, filter_keyword: str = "") -> d
 
 @mcp.tool()
 async def apply_settings_and_preview(threemf_path: str, settings_patch: dict, rotate_z_deg: float = 0.0,
-                                     run_slice: bool = True, reload_gui: bool = True) -> dict:
+                                     run_slice: bool = True, reload_gui: bool = True,
+                                     confirm_close_unsaved: bool = False) -> dict:
     """Applica settings_patch (qualsiasi chiave di project_settings.config, es.
     {"wall_loops": 4, "sparse_infill_density": "20%", "nozzle_temperature": 215}) al .3mf.
     - .3mf grezzo dal CAD (o .stl/.step): viene prima inizializzato con i profili base
@@ -1297,28 +1549,37 @@ async def apply_settings_and_preview(threemf_path: str, settings_patch: dict, ro
     - rotate_z_deg: ruota gli oggetti attorno all'asse Z (gradi, antiorario).
     - run_slice (o rotazione): slicing headless -> <nome>.gcode.3mf con tempo stimato,
       consumo filamento, avvisi dello slicer e analisi geometrica degli sbalzi.
-    - reload_gui: chiude Bambu Studio se ha aperto questo file e lo riapre in primo piano
-      con l'anteprima aggiornata. Un backup del progetto viene salvato in .bambu_mcp_backup."""
+    - reload_gui: chiude SOLO la finestra di Bambu Studio che ha aperto questo file (chiusura
+      normale; se compare "Save" sceglie "No", perche' il file viene comunque sovrascritto) e lo
+      riapre in primo piano con l'anteprima aggiornata. Le altre finestre non vengono toccate.
+      Se una finestra con lo stesso nome ha modifiche non salvate ma il percorso non e' verificabile,
+      non viene chiusa: la risposta contiene needs_confirmation=true e warnings. Chiedi all'utente e,
+      solo se conferma, rilancia con confirm_close_unsaved=true.
+    Controlla sempre 'gui_summary' e 'warnings' nella risposta e riferiscili all'utente.
+    Un backup del progetto viene salvato in .bambu_mcp_backup."""
     def run() -> dict:
         with _LOCK:
-            return process_3mf(threemf_path, settings_patch, rotate_z_deg, run_slice, reload_gui)
+            return process_3mf(threemf_path, settings_patch, rotate_z_deg, run_slice, reload_gui,
+                               confirm_close_unsaved=confirm_close_unsaved)
     return await anyio.to_thread.run_sync(run)
 
 
 @mcp.tool()
 async def apply_default_cad_preset(threemf_path: str, seam_position: str = "back", infill_percent: int = 18,
                                    bed_temp: int = 60, nozzle_temp: int = 215,
-                                   rotate_z_deg: float = 0.0) -> dict:
+                                   rotate_z_deg: float = 0.0, confirm_close_unsaved: bool = False) -> dict:
     """Preset rapido per pezzi da CAD: layer 0.2 mm (anche primo layer), Textured PEI Plate a
     bed_temp (55-60 C), ugello nozzle_temp (Sunlu PLA Matte), Arachne con 3 pareti, 5 strati
     superiori / 4 inferiori, gyroid al infill_percent (15-20%), supporti OFF (con verifica sbalzi),
     cucitura seam_position ('back' o 'aligned'), brim OFF, compensazione piede d'elefante 0.15 mm.
     rotate_z_deg ruota il pezzo sull'asse Z (es. per allontanare la cucitura dalle linguette).
-    Poi slicing e ricarica della GUI."""
+    Poi slicing e ricarica della GUI (stesse regole di chiusura sicura di apply_settings_and_preview;
+    confirm_close_unsaved=true solo dopo conferma esplicita dell'utente)."""
     def run() -> dict:
         patch, notes = default_cad_patch(seam_position, infill_percent, bed_temp, nozzle_temp)
         with _LOCK:
-            rep = process_3mf(threemf_path, patch, rotate_z_deg, True, True)
+            rep = process_3mf(threemf_path, patch, rotate_z_deg, True, True,
+                              confirm_close_unsaved=confirm_close_unsaved)
         if notes:
             rep["preset_notes"] = notes
         return rep
