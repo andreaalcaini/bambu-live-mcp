@@ -106,8 +106,9 @@ Il server tratta in modo diverso ogni istanza di Bambu Studio aperta. Per ricono
 | Finestra aperta | Cosa fa il tool |
 |---|---|
 | Il file che il tool sovrascrive (stesso percorso) | Chiusura normale (WM_CLOSE). Se compare "Bambu Studio - Save" preme **No** con un click inviato alla finestra (nessun mouse o tastiera reale) e non spunta "Remember my choice". |
-| Stesso nome, ma percorso diverso o non verificabile, **con** `*` | Non la chiude. Risponde con `needs_confirmation: true` e un avviso. Solo dopo la conferma dell'utente si rilancia con `confirm_close_unsaved: true`. |
-| Stesso nome, percorso diverso, **senza** modifiche | Chiusura normale (non si perde nulla). |
+| Stesso nome, ma percorso **non verificabile** (dati di ripristino assenti), **con** `*` | Non la chiude. Risponde con `needs_confirmation: true` e un avviso. Solo dopo la conferma dell'utente si rilancia con `confirm_close_unsaved: true`. |
+| Stesso nome, percorso non verificabile, **senza** modifiche | Chiusura normale (non si perde nulla). |
+| Stesso nome ma **percorso diverso** (noto) | È un altro progetto: non la tocca mai. |
 | Un altro progetto (con o senza `*`) | Non la tocca mai. Se ha modifiche non salvate lo segnala in `warnings`. |
 
 Termina il processo solo se la finestra del file del tool non si chiude entro `gui_close_timeout_s`, e solo quel processo.

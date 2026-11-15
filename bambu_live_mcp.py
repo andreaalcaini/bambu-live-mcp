@@ -1126,8 +1126,9 @@ def bambu_instances() -> list[dict]:
 def _relation(inst: dict, targets: list[Path]) -> str:
     """'target' = ha aperto esattamente un file che il tool sovrascrive;
     'ambiguous' = stesso nome ma percorso diverso/sconosciuto; 'other' = altro progetto."""
-    if inst.get("origin") and any(_norm(inst["origin"]) == _norm(t) for t in targets):
-        return "target"
+    if inst.get("origin"):
+        # percorso noto: o e' esattamente il file del tool, o e' un altro progetto (anche se ha lo stesso nome)
+        return "target" if any(_norm(inst["origin"]) == _norm(t) for t in targets) else "other"
     name = inst.get("project_name") or ""
     if name and _stems(Path(name + ".3mf"))[0] in _stems(*targets):  # "X.gcode" -> "x"
         return "ambiguous"
