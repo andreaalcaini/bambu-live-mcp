@@ -1,0 +1,17 @@
+{
+  "bambu_studio_exe": "",
+  "bambu_user_id": "",
+  "profiles": {
+    "machine": "Bambu Lab A1 0.4 nozzle",
+    "process": "0.20mm Standard @BBL A1",
+    "filament": "SUNLU PLA Matte @BBL A1"
+  },
+  "gui_close_timeout_s": 12,
+  "gui_force_kill_on_timeout": true,
+  "gui_when_other_project_open": "open",
+  "gui_open_target": "sliced",
+  "slice_timeout_s": 900,
+  "backups_to_keep": 10,
+  "overhang_critical_angle_deg": 30,
+  "overhang_warning_angle_deg": 45
+}

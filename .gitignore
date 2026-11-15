@@ -1,0 +1,22 @@
+# ambiente e cache
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# configurazione locale (vedi config.example.json)
+config.json
+
+# file generati dal server
+templates/
+work/
+test/
+.bambu_mcp_backup/
+*.tmp
+
+# file di stampa
+*.3mf
+*.gcode
+*.stl
+*.step
+*.stp
