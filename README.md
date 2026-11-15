@@ -45,7 +45,8 @@ copy config.example.json config.json   # poi modifica i profili se serve
   2. applica `settings_patch` (qualsiasi chiave; gli scalari vanno su tutti i filamenti; `20` diventa `"20%"` dove serve; aggiorna `different_settings_to_system`).
   3. ruota gli oggetti attorno a Z (`rotate_z_deg`).
   4. slicing headless e lettura di `result.json`, `slice_info.config` e intestazione G-code: tempo stimato, grammi/metri di filamento, avvisi dello slicer, più un'**analisi geometrica degli sbalzi** (facce < 30° dall'orizzontale non appoggiate al piatto).
-  5. chiude la finestra di Bambu Studio se ha aperto quel file (WM_CLOSE, poi la termina dopo 12 s se resta bloccata su un dialogo) e riapre `<nome>.gcode.3mf` in primo piano sull'anteprima.
+  5. ricarica la GUI in modo sicuro (vedi [Chiusura sicura di Bambu Studio](#chiusura-sicura-di-bambu-studio)) e riapre `<nome>.gcode.3mf` in primo piano sull'anteprima.
+  Parametro facoltativo `confirm_close_unsaved` (default `false`): da usare solo dopo una conferma esplicita dell'utente.
   Prima di sovrascrivere salva un backup in `.bambu_mcp_backup\` accanto al file.
 - **`apply_default_cad_preset(threemf_path, seam_position="back", infill_percent=18, bed_temp=60, nozzle_temp=215, rotate_z_deg=0)`**:
   layer 0.2/0.2, Textured PEI Plate, Arachne con 3 pareti, 5 strati sopra e 4 sotto, gyroid, supporti OFF, brim OFF, piede d'elefante 0.15, cucitura `back`/`aligned`.
@@ -96,6 +97,31 @@ cd C:\bambu-mcp
 - Il risultato dello slicing è `<nome>.gcode.3mf` accanto al progetto: contiene modello, impostazioni e G-code, quindi si apre direttamente in anteprima e si invia via Cloud dalla GUI.
 - `gui_open_target: "project"` in `config.json` apre invece il `.3mf` di progetto (scheda Prepara).
 - Se Bambu Studio ha aperto un **altro** progetto non viene chiuso: il file si apre in una nuova istanza (`gui_when_other_project_open: "skip"` per non aprire nulla).
+
+## Chiusura sicura di Bambu Studio
+
+Il server tratta in modo diverso ogni istanza di Bambu Studio aperta. Per riconoscere il file aperto usa il percorso esatto in
+`%TEMP%\bamboo_model\...\origin.txt` e il titolo della finestra, dove `* ` indica modifiche non salvate.
+
+| Finestra aperta | Cosa fa il tool |
+|---|---|
+| Il file che il tool sovrascrive (stesso percorso) | Chiusura normale (WM_CLOSE). Se compare "Bambu Studio - Save" preme **No** con un click inviato alla finestra (nessun mouse o tastiera reale) e non spunta "Remember my choice". |
+| Stesso nome, ma percorso **non verificabile** (dati di ripristino assenti), **con** `*` | Non la chiude. Risponde con `needs_confirmation: true` e un avviso. Solo dopo la conferma dell'utente si rilancia con `confirm_close_unsaved: true`. |
+| Stesso nome, percorso non verificabile, **senza** modifiche | Chiusura normale (non si perde nulla). |
+| Stesso nome ma **percorso diverso** (noto) | È un altro progetto: non la tocca mai. |
+| Un altro progetto (con o senza `*`) | Non la tocca mai. Se ha modifiche non salvate lo segnala in `warnings`. |
+
+Termina il processo solo se la finestra del file del tool non si chiude entro `gui_close_timeout_s`, e solo quel processo.
+Subito dopo cancella le sue cartelle di ripristino, così al riavvio Bambu Studio non propone di ripristinare il progetto.
+Cancella anche le cartelle di ripristino lasciate dalla CLI di slicing.
+
+Nella risposta del tool:
+- `unsaved_changes_found` dice se c'erano modifiche non salvate;
+- `warnings` contiene gli avvisi da riferire all'utente;
+- `gui_summary` dice in breve cosa è stato fatto a ogni finestra;
+- `gui.close.instances` riporta il dettaglio di ogni istanza: `relation`, `unsaved_changes`, `action`, `recovery_data_removed`.
+
+Il popup "New version of Bambu Studio" viene ignorato: non blocca la chiusura.
 - Tieni Bambu Studio aggiornato: la CLI e i profili di sistema sono quelli installati.
 
 ## Licenza
